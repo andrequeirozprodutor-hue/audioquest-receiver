@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audio Quest Receiver</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #090909; color: #fff; font-family: Arial, sans-serif; }
+    header { padding: 24px; border-bottom: 1px solid #292929; display: flex; justify-content: space-between; align-items: center; }
+    .logo { color: #d4ff00; font-size: 24px; font-weight: 900; letter-spacing: 2px; }
+    .status { color: #aaa; font-size: 13px; }
+    main { max-width: 1200px; margin: auto; padding: 30px; }
+    h2 { font-size: 18px; }
+    .monitor { background: #161616; border: 1px solid #333; border-radius: 14px; aspect-ratio: 16 / 9; display: flex; justify-content: center; align-items: center; position: relative; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: contain; position: absolute; }
+    .placeholder { color: #777; text-align: center; }
+    .placeholder strong { display: block; color: #d4ff00; font-size: 22px; margin-bottom: 12px; }
+    .controls { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+    button { background: #d4ff00; color: #090909; border: 0; border-radius: 8px; padding: 14px 24px; font-weight: bold; cursor: pointer; }
+    button.secondary { background: #292929; color: #fff; }
+    .info { margin-top: 28px; padding: 20px; background: #191919; border-radius: 12px; color: #aaa; line-height: 1.8; }
+    .info b { color: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">AUDIO QUEST</div>
+    <div class="status" id="status">● RECEPTOR DESCONECTADO</div>
+  </header>
+  <main>
+    <h2>MONITOR DE TRANSMISSÃO</h2>
+    <div class="monitor">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <div class="placeholder" id="placeholder">
+        <strong>AGUARDANDO SINAL</strong>
+        Nenhuma transmissão recebida
+      </div>
+    </div>
+    <div class="controls">
+      <button id="connectButton">CONECTAR À CENTRAL</button>
+      <button class="secondary" id="disconnectButton">DESCONECTAR</button>
+    </div>
+    <div class="info">
+      <div><b>Produto:</b> Audio Quest Receiver</div>
+      <div><b>Servidor:</b> audioquest-server.onrender.com</div>
+      <div><b>Sala:</b> audioquest-test</div>
+      <div><b>Protocolo de mídia:</b> WebRTC</div>
+      <div><b>Estado:</b> <span id="mediaState">Aguardando conexão</span></div>
+    </div>
+  </main>
+
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+  <script>
+    const SERVER_URL = "https://audioquest-server.onrender.com";
+    const ROOM = "audioquest-test";
+    const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+
+    const statusElement = document.getElementById("status");
+    const connectButton = document.getElementById("connectButton");
+    const disconnectButton = document.getElementById("disconnectButton");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const placeholder = document.getElementById("placeholder");
+    const mediaState = document.getElementById("mediaState");
+
+    let socket = null;
+    let peerConnection = null;
+    let activeReporterId = null;
+    let pendingCandidates = [];
+    let signalingQueue = Promise.resolve();
+
+    function updateMediaState(message) {
+      mediaState.textContent = message;
+    }
+
+    function resetPeerConnection() {
+      const previous = peerConnection;
+      peerConnection = null;
+      activeReporterId = null;
+      pendingCandidates = [];
+      if (previous) {
+        previous.ontrack = null;
+        previous.onicecandidate = null;
+        previous.onconnectionstatechange = null;
+        previous.close();
+      }
+      remoteVideo.pause();
+      remoteVideo.srcObject = null;
+      placeholder.style.display = "block";
+      updateMediaState("Aguardando transmissão");
+    }
+
+    function sendSignal(target, payload) {
+      if (!socket || !socket.connected) {
+        console.warn("Sinal não enviado: central desconectada");
+        return;
+      }
+      socket.emit("signal", { target, payload });
+    }
+
+    function createPeerConnection(reporterId) {
+      resetPeerConnection();
+      activeReporterId = reporterId;
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      peerConnection = pc;
+      updateMediaState("Negociando WebRTC...");
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        const candidate = event.candidate.toJSON();
+        sendSignal(reporterId, {
+          type: "candidate",
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid,
+          sdpMLineIndex: candidate.sdpMLineIndex
+        });
+      };
+
+      pc.ontrack = (event) => {
+        if (pc !== peerConnection) return;
+        console.log("Trilha recebida:", event.track.kind);
+        let stream = remoteVideo.srcObject;
+        if (!stream) {
+          stream = new MediaStream();
+          remoteVideo.srcObject = stream;
+        }
+        if (!stream.getTracks().some(track => track.id === event.track.id)) {
+          stream.addTrack(event.track);
+        }
+        placeholder.style.display = "none";
+        updateMediaState("Recebendo trilhas de mídia");
+        remoteVideo.play().catch(error => {
+          console.warn("Reprodução automática bloqueada:", error);
+          updateMediaState("Clique no monitor para liberar o áudio/vídeo");
+        });
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc !== peerConnection) return;
+        console.log("Estado WebRTC:", pc.connectionState);
+        if (pc.connectionState === "connected") {
+          updateMediaState("Transmissão WebRTC conectada");
+        } else if (pc.connectionState === "failed") {
+          updateMediaState("Falha na conexão WebRTC");
+        } else if (pc.connectionState === "disconnected") {
+          updateMediaState("Sinal de mídia interrompido");
+        } else if (pc.connectionState === "closed") {
+          updateMediaState("Conexão WebRTC encerrada");
+        }
+      };
+      return pc;
+    }
+
+    async function handleOffer(from, payload) {
+      const sdp = typeof payload.sdp === "string" ? payload.sdp : payload.sdp?.description;
+      if (!sdp) throw new Error("Oferta WebRTC sem SDP válido");
+
+console.log("DIAGNÓSTICO SDP:");
+console.log("Oferta contém áudio:", sdp.includes("m=audio"));
+console.log("Oferta contém vídeo:", sdp.includes("m=video"));
+console.log(
+    "Seções de mídia:",
+    sdp.split("\r\n").filter(linha => linha.startsWith("m="))
+);
+      const pc = createPeerConnection(from);
+      await pc.setRemoteDescription({ type: "offer", sdp });
+      console.log("Oferta WebRTC aplicada:", from);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      if (pc !== peerConnection) return;
+      sendSignal(from, { type: "answer", sdp: pc.localDescription.sdp });
+      console.log("Resposta WebRTC enviada:", from);
+
+      for (const candidate of pendingCandidates.splice(0)) {
+        await pc.addIceCandidate(candidate);
+      }
+    }
+
+    function parseCandidate(payload) {
+      const raw = payload.candidate;
+      if (typeof raw === "string") {
+        return {
+          candidate: raw,
+          sdpMid: payload.sdpMid ?? null,
+          sdpMLineIndex: payload.sdpMLineIndex ?? null
+        };
+      }
+      if (raw && typeof raw === "object") {
+        return {
+          candidate: raw.candidate,
+          sdpMid: raw.sdpMid ?? payload.sdpMid ?? null,
+          sdpMLineIndex: raw.sdpMLineIndex ?? payload.sdpMLineIndex ?? null
+        };
+      }
+      throw new Error("Candidato ICE em formato desconhecido");
+    }
+
+    async function handleCandidate(from, payload) {
+      if (activeReporterId && from !== activeReporterId) {
+        console.log("Candidato ignorado de outro repórter:", from);
+        return;
+      }
+      const candidate = parseCandidate(payload);
+      if (!peerConnection || !peerConnection.remoteDescription) {
+        pendingCandidates.push(candidate);
+        return;
+      }
+      await peerConnection.addIceCandidate(candidate);
+      console.log("Candidato ICE aplicado:", from);
+    }
+
+    remoteVideo.addEventListener("click", () => {
+      remoteVideo.play().catch(error => console.warn("Não foi possível reproduzir:", error));
+    });
+
+    connectButton.addEventListener("click", () => {
+      if (typeof io !== "function") {
+        console.error("Biblioteca Socket.IO não carregou");
+        statusElement.textContent = "● ERRO AO CARREGAR SOCKET.IO";
+        statusElement.style.color = "#ff4545";
+        return;
+      }
+      if (socket) {
+        socket.removeAllListeners();
+        socket.disconnect();
+      }
+      resetPeerConnection();
+      signalingQueue = Promise.resolve();
+      statusElement.textContent = "● CONECTANDO À CENTRAL...";
+      statusElement.style.color = "#aaa";
+
+      const currentSocket = io(SERVER_URL, { reconnection: true, timeout: 20000 });
+      socket = currentSocket;
+
+      currentSocket.on("connect", () => {
+        console.log("Conectado ao servidor:", currentSocket.id);
+        currentSocket.emit("join-room", { room: ROOM, role: "receiver" });
+      });
+
+      currentSocket.on("room-joined", data => {
+        console.log("Sala confirmada:", data);
+        statusElement.textContent = "● CENTRAL CONECTADA";
+        statusElement.style.color = "#d4ff00";
+        console.log("Participantes já presentes:", data.peers || []);
+      });
+
+      currentSocket.on("peer-joined", data => {
+        console.log("Novo participante:", data);
+        if (data.role === "reporter") {
+          console.log("Repórter disponível para transmissão:", data.peerId);
+        }
+      });
+
+      currentSocket.on("signal", data => {
+        console.log("Sinal WebRTC recebido:", data);
+        if (!data || typeof data.from !== "string" || !data.payload) return;
+        const { from, payload } = data;
+        if (payload.type !== "offer" && payload.type !== "candidate") return;
+        signalingQueue = signalingQueue
+          .then(async () => {
+            if (socket !== currentSocket) return;
+            if (payload.type === "offer") await handleOffer(from, payload);
+            if (payload.type === "candidate") await handleCandidate(from, payload);
+          })
+          .catch(error => {
+            console.error("Falha na negociação WebRTC:", error);
+            updateMediaState("Erro WebRTC: " + error.message);
+          });
+      });
+
+      currentSocket.on("peer-left", data => {
+        console.log("Participante saiu:", data);
+        if (data.peerId === activeReporterId) resetPeerConnection();
+      });
+
+      currentSocket.on("connect_error", error => {
+        console.error("Erro de conexão:", error.message);
+        statusElement.textContent = "● ERRO DE CONEXÃO";
+        statusElement.style.color = "#ff4545";
+      });
+
+      currentSocket.on("disconnect", () => {
+        statusElement.textContent = "● RECEPTOR DESCONECTADO";
+        statusElement.style.color = "#aaa";
+        resetPeerConnection();
+      });
+    });
+
+    disconnectButton.addEventListener("click", () => {
+      if (socket) {
+        socket.removeAllListeners();
+        socket.disconnect();
+        socket = null;
+      }
+      resetPeerConnection();
+      statusElement.textContent = "● RECEPTOR DESCONECTADO";
+      statusElement.style.color = "#aaa";
+    });
+  </script>
+</body>
+</html>
